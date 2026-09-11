@@ -1564,3 +1564,134 @@ fn a_colour_emoji_font_renders_its_bitmaps_without_embedding_the_font() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// Header/footer images must be registered as PDF resources as well as laid out.
+#[test]
+fn header_footer_embedded_images_repeat_in_batch_and_streaming() {
+    use base64::Engine as _;
+    let png = base64::engine::general_purpose::STANDARD
+        .encode(include_bytes!("fixtures/images/spike_opaque.png"));
+    check_overlay_image(
+        &format!("data:image/png;base64,{png}"),
+        "/Subtype /Image",
+        "png",
+    );
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn header_footer_embedded_svg_images_repeat_in_batch_and_streaming() {
+    use base64::Engine as _;
+    let svg = base64::engine::general_purpose::STANDARD.encode(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="20" fill="#ff0000"/></svg>"##,
+    );
+    check_overlay_image(
+        &format!("data:image/svg+xml;base64,{svg}"),
+        "/Subtype /Form",
+        "svg",
+    );
+}
+
+fn check_overlay_image(src: &str, resource_type: &str, kind: &str) {
+    let dir =
+        std::env::temp_dir().join(format!("sghtmltopdf-overlay-{kind}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let template = dir.join("overlay.html");
+    for page_dependent in [false, true] {
+        let token = if page_dependent { "[page]" } else { "Header" };
+        for background in [false, true] {
+            let image = if background {
+                format!(
+                    r#"<div style="width:20px;height:20px;background-repeat:no-repeat;background-image:url('{src}')"></div>"#
+                )
+            } else {
+                format!(r#"<img src="{src}" width="20" height="20">"#)
+            };
+            std::fs::write(
+                &template,
+                format!(r#"<html><body style="margin:0">{image}{token}</body></html>"#),
+            )
+            .unwrap();
+            for streaming in [false, true] {
+                let mut args = vec![
+                    "--no-pdf-compression",
+                    "--header-html",
+                    template.to_str().unwrap(),
+                    "--footer-html",
+                    template.to_str().unwrap(),
+                ];
+                if streaming {
+                    args.push("--streaming");
+                }
+                let bytes = run_cli_with(TWO_PAGE_HTML, &args, &format!("overlay-{kind}"));
+                assert_eq!(count_occurrences(&bytes, b"/MediaBox"), 2);
+                assert_eq!(
+                    count_occurrences(&bytes, resource_type.as_bytes()),
+                    1,
+                    "shared image should be embedded once"
+                );
+                assert_eq!(
+                    count_occurrences(&bytes, b" Do"),
+                    4,
+                    "header and footer image should be drawn on both pages"
+                );
+                assert!(
+                    count_occurrences(&bytes, b"W\nn") >= 4,
+                    "overlays must remain clipped"
+                );
+                args.push("--no-images");
+                let bytes = run_cli_with(TWO_PAGE_HTML, &args, &format!("overlay-{kind}-disabled"));
+                assert_eq!(count_occurrences(&bytes, resource_type.as_bytes()), 0);
+                assert_eq!(count_occurrences(&bytes, b" Do"), 0);
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn header_footer_images_keep_external_resources_blocked_and_honor_abort() {
+    let dir =
+        std::env::temp_dir().join(format!("sghtmltopdf-overlay-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let template = dir.join("overlay.html");
+    let body = dir.join("body.html");
+    std::fs::write(&body, TWO_PAGE_HTML).unwrap();
+    let local_image = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/images/spike_opaque.png"
+    );
+    for src in [local_image, "data:image/png;base64,invalid"] {
+        std::fs::write(
+            &template,
+            format!(r#"<img src="{src}" width="20" height="20">[page]"#),
+        )
+        .unwrap();
+        for streaming in [false, true] {
+            let mut args = vec![
+                "--no-pdf-compression",
+                "--header-html",
+                template.to_str().unwrap(),
+                "--enable-local-file-access",
+            ];
+            if streaming {
+                args.push("--streaming");
+            }
+            let bytes = run_cli_with(TWO_PAGE_HTML, &args, "overlay-errors-ignore");
+            assert_eq!(count_occurrences(&bytes, b"/Subtype /Image"), 0);
+            let result = Command::new(BIN)
+                .arg(&body)
+                .args(&args)
+                .args(["--font", FONT_PATH, "--load-media-error-handling", "abort"])
+                .arg("-o")
+                .arg(dir.join("abort.pdf"))
+                .output()
+                .unwrap();
+            assert!(
+                !result.status.success(),
+                "abort must report failed header images"
+            );
+        }
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
